@@ -1,31 +1,28 @@
 #![feature(allocator_api)]
-#![feature(unsize)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use core::marker::{PhantomData, Unsize};
+use core::marker::PhantomData;
 use core::ptr::{self, NonNull};
 use std::alloc::{self, AllocError, Allocator, Layout};
-use std::fmt::{self, Debug};
 
 pub use crate::vtable::RawPolyAllocVTable;
 
 pub mod vtable;
 
-/// Holds an erased allocator data pointer and vtable reference.
-/// The `Owned` type parameterizes this struct over the available auto traits, as well as
-/// marking that this type owns a type-erased allocator.
-struct RawPolyAllocator<Owned: ?Sized> {
-    /// A pointer to the allocator (erased). The memory behind the pointer is
-    /// allocated by the allocator.
+/// A polymorphic allocator.
+#[derive(Debug)]
+pub struct LocalPolyAllocator<'a> {
+    /// A pointer to the allocator (erased). In the case of owned allocations, the memory behind
+    /// the pointer is allocated by the allocator.
     data: NonNull<()>,
     /// A reference to the vtable.
     vtable: &'static RawPolyAllocVTable,
-    _ph: PhantomData<Owned>,
+    _ph: PhantomData<dyn Allocator + 'a>,
 }
 
 // Drop
 
-impl<Owned: ?Sized> Drop for RawPolyAllocator<Owned> {
+impl Drop for LocalPolyAllocator<'_> {
     fn drop(&mut self) {
         unsafe {
             (self.vtable.delete)(self.data);
@@ -33,28 +30,19 @@ impl<Owned: ?Sized> Drop for RawPolyAllocator<Owned> {
     }
 }
 
-// Send and Sync
-
-unsafe impl<Owned: Send + ?Sized> Send for RawPolyAllocator<Owned> {}
-unsafe impl<Owned: Sync + ?Sized> Sync for RawPolyAllocator<Owned> {}
-
 // Clone
 
-impl<Owned: ?Sized> Clone for RawPolyAllocator<Owned> {
+impl Clone for LocalPolyAllocator<'_> {
     fn clone(&self) -> Self {
-        Self {
-            data: unsafe { (self.vtable.clone)(self.data.as_ptr()) },
-            vtable: self.vtable,
-            _ph: PhantomData,
-        }
+        // SAFETY: We have a proper new data pointer from the clone method in the vtable
+        unsafe { Self::from_raw_parts((self.vtable.clone)(self.data.as_ptr()), self.vtable) }
     }
 }
 
-impl<Owned: ?Sized> RawPolyAllocator<Owned> {
-    /// SAFETY: `data` must be currently allocated by the allocator it points to, and `vtable`
-    ///         must be a vtable compatible with the allocator type. Additionally, the `Owned`
-    ///         type must be coercible from the allocator type.
-    unsafe fn new_unchecked(data: NonNull<()>, vtable: &'static RawPolyAllocVTable) -> Self {
+impl<'a> LocalPolyAllocator<'a> {
+    /// SAFETY: `vtable` must be a vtable compatible with the allocator type underlying `data`.
+    ///         Additionally, the underlying type must live for `'a`.
+    pub unsafe fn from_raw_parts(data: NonNull<()>, vtable: &'static RawPolyAllocVTable) -> Self {
         Self {
             data,
             vtable,
@@ -62,37 +50,54 @@ impl<Owned: ?Sized> RawPolyAllocator<Owned> {
         }
     }
 
-    fn try_new<A>(allocator: A) -> Result<Self, AllocError>
+    pub fn try_owned<A>(allocator: A) -> Result<Self, AllocError>
     where
-        A: Allocator + Clone + Unsize<Owned>,
+        A: Allocator + Clone + 'a,
     {
         let layout = Layout::new::<A>();
         let storage = allocator.allocate(layout)?.cast::<A>();
-        // SAFETY: `storage` points to allocated memory for type `A`.
+        // SAFETY: `storage` points to allocated memory for type `A`, which the generic
+        //         bounds guarantee lives for `'a`.
         unsafe {
             ptr::write(storage.as_ptr(), allocator);
-            Ok(Self::new_unchecked(
+            Ok(Self::from_raw_parts(
                 storage.cast::<()>(),
-                RawPolyAllocVTable::of::<A>(),
+                RawPolyAllocVTable::owned::<A>(),
             ))
         }
     }
 
-    fn new<A>(allocator: A) -> Self
+    pub fn owned<A>(allocator: A) -> Self
     where
-        A: Allocator + Clone + Unsize<Owned>,
+        A: Allocator + Clone + 'a,
     {
-        match Self::try_new(allocator) {
+        match Self::try_owned(allocator) {
             Ok(ret) => ret,
             Err(_) => alloc::handle_alloc_error(Layout::new::<A>()),
         }
     }
+
+    pub fn borrowed<A>(allocator: &'a A) -> Self
+    where
+        A: Allocator + 'a,
+    {
+        // SAFETY: The vtable is compatible with `A` in a borrowed context, and we borrow
+        //         the allocator for `'a`.
+        unsafe {
+            Self::from_raw_parts(
+                NonNull::from(allocator).cast::<()>(),
+                RawPolyAllocVTable::borrowed::<A>(),
+            )
+        }
+    }
+
+    pub fn into_raw_parts(self) -> (NonNull<()>, &'static RawPolyAllocVTable) {
+        (self.data, self.vtable)
+    }
 }
 
-// Allocator for RawPolyAllocator
-
 /// SAFETY: we forward all method impls to the underlying allocator.
-unsafe impl<Owned: ?Sized> Allocator for RawPolyAllocator<Owned> {
+unsafe impl Allocator for LocalPolyAllocator<'_> {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         unsafe { (self.vtable.allocate)(self.data.as_ptr(), layout) }
     }
@@ -133,27 +138,28 @@ unsafe impl<Owned: ?Sized> Allocator for RawPolyAllocator<Owned> {
     }
 }
 
-// Debug impl for all types
-impl<Owned: ?Sized> Debug for RawPolyAllocator<Owned> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RawPolyAllocator")
-            .field("data", &self.data)
-            .field("vtable", &self.vtable)
-            .finish()
-    }
-}
-
 // Allocator wrappers
 
+/// A polymorphic allocator which can be sent across threads.
 #[derive(Clone, Debug)]
-pub struct PolyAllocator<'a>(RawPolyAllocator<dyn Allocator + Send + 'a>);
+pub struct PolyAllocator<'a>(LocalPolyAllocator<'a>);
+
+/// SAFETY: Only constructed with `Send` underlying allocators.
+unsafe impl Send for PolyAllocator<'_> {}
 
 impl<'a> PolyAllocator<'a> {
-    pub fn new<A>(allocator: A) -> Self
+    pub fn owned<A>(allocator: A) -> Self
     where
         A: Allocator + Clone + Send + 'a,
     {
-        Self(RawPolyAllocator::new(allocator))
+        Self(LocalPolyAllocator::owned(allocator))
+    }
+
+    pub fn borrowed<A>(allocator: &'a A) -> Self
+    where
+        A: Allocator + Send + 'a,
+    {
+        Self(LocalPolyAllocator::borrowed(allocator))
     }
 }
 
@@ -211,8 +217,7 @@ mod tests {
             "Box<(), PolyAllocator>: {}",
             core::mem::size_of::<Box<(), PolyAllocator>>()
         );
-        // let allocator = PolyAllocator::new(Global);
-        let allocator = PolyAllocator::new(PolyAllocator::new(PolyAllocator::new(Global)));
+        let allocator = PolyAllocator::owned(PolyAllocator::owned(PolyAllocator::owned(Global)));
         let mut v = Vec::new_in(allocator);
         v.push(3);
         v.push(4);
@@ -220,7 +225,7 @@ mod tests {
         let _ = v.clone();
 
         let (a, mut _b) = (Global, None);
-        _b = Some(PolyAllocator::new(&a));
+        _b = Some(PolyAllocator::borrowed(&a));
 
         // let allocator = PolyAllocator::new(Global);
         // let v = Box::new_in(3, allocator);
