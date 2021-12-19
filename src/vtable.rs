@@ -1,5 +1,6 @@
+use alloc::alloc::handle_alloc_error;
+use core::alloc::{AllocError, Allocator, Layout};
 use core::ptr::{self, NonNull};
-use std::alloc::{self, AllocError, Allocator, Layout};
 
 /// Allocator trait vtable struct.
 /// SAFETY: All functions must be called using a valid data pointer for the type
@@ -56,7 +57,6 @@ where
         let allocator = ptr::read(storage.as_ptr());
         allocator.deallocate(storage.cast::<u8>(), layout);
     }
-    println!("Dropped allocator!");
 }
 
 /// Clones the underlying allocator into a new allocation.
@@ -69,7 +69,7 @@ where
     let layout = Layout::new::<A>();
     let new_storage = match this.allocate(layout) {
         Ok(storage) => storage.cast::<A>(),
-        Err(_) => alloc::handle_alloc_error(layout),
+        Err(_) => handle_alloc_error(layout),
     };
     // SAFETY: we just allocated `new_storage` for a value of type `A`.
     unsafe {
