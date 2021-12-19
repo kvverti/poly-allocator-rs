@@ -21,10 +21,13 @@ pub struct PolyAllocator<'a, Traits> {
 // autp trait impls
 
 /// SAFETY: We only allow constructing with Send backing allocators when using this trait.
-unsafe impl<Traits: Send> Send for PolyAllocator<'_, Traits> {}
+unsafe impl Send for PolyAllocator<'_, SendTrait> {}
+
+/// SAFETY: We only allow constructing with Send backing allocators when using this trait.
+unsafe impl Send for PolyAllocator<'_, SendSyncTrait> {}
 
 /// SAFETY: We only allow constructing with Sync backing allocators when using this trait.
-unsafe impl<Traits: Sync> Sync for PolyAllocator<'_, Traits> {}
+unsafe impl Sync for PolyAllocator<'_, SendSyncTrait> {}
 
 // Drop
 
